@@ -1,95 +1,141 @@
 import os
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
-from pymongo import MongoClient
-from pymongo.collection import Collection
-from pymongo.database import Database
+
+DEFAULT_DATABASE_PATH = "data/medical_assistant.db"
 
 
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
-DATABASE_NAME = "medical_reports"
+@contextmanager
+def get_connection():
+    database_path = Path(os.getenv("DATABASE_PATH", DEFAULT_DATABASE_PATH))
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(database_path)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
-_client = MongoClient(MONGODB_URI)
-database: Database = _client[DATABASE_NAME]
-
-patient_reports: Collection = database["patient_reports"]
-generated_reports: Collection = database["generated_reports"]
-external_materials: Collection = database["external_materials"]
-
-
-def connect_to_database() -> str:
-    """Check that MongoDB is reachable and return a status message."""
-    _client.admin.command("ping")
-    return "MongoDB connection successful"
-
-
-def create_indexes() -> None:
-    """Create indexes used by the application."""
-    patient_reports.create_index("patient_id")
-    generated_reports.create_index("patient_id")
-    generated_reports.create_index("patient_report_id")
-    external_materials.create_index("title")
-
-
-def save_patient_report(
-    patient_id: str,
-    report_text: str,
-    report_type: str | None = None,
-    file_name: str | None = None,
-) -> Any:
-    """Save an original patient report and return its MongoDB ID."""
-    result = patient_reports.insert_one({
-        "patient_id": patient_id,
-        "report_type": report_type,
-        "report_text": report_text,
-        "file_name": file_name,
-    })
-    return result.inserted_id
+def init_database() -> None:
+    with get_connection() as connection:
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS patient_reports (
+                id TEXT PRIMARY KEY, patient_id TEXT NOT NULL, title TEXT NOT NULL,
+                report_text TEXT NOT NULL, file_name TEXT, created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS communication_records (
+                id TEXT PRIMARY KEY, patient_id TEXT NOT NULL, report_id TEXT,
+                sender_role TEXT NOT NULL, message_text TEXT NOT NULL,
+                tone TEXT, complexity TEXT, created_at TEXT NOT NULL,
+                FOREIGN KEY(report_id) REFERENCES patient_reports(id)
+            );
+            CREATE TABLE IF NOT EXISTS reference_chunks (
+                id TEXT PRIMARY KEY, document_title TEXT NOT NULL, publisher TEXT,
+                source TEXT, chunk_number INTEGER NOT NULL, chunk_text TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+        """)
 
 
-def save_generated_report(
-    patient_report_id: Any,
-    patient_id: str,
-    generated_text: str,
-    tone: str,
-    model_name: str | None = None,
-) -> Any:
-    """Save an LLM-generated report and return its MongoDB ID."""
-    result = generated_reports.insert_one({
-        "patient_report_id": patient_report_id,
-        "patient_id": patient_id,
-        "generated_text": generated_text,
-        "tone": tone,
-        "model_name": model_name,
-    })
-    return result.inserted_id
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def save_external_material(
-    title: str,
-    content: str,
-    source: str | None = None,
-    material_type: str | None = None,
-) -> Any:
-    """Save an external medical reference and return its MongoDB ID."""
-    result = external_materials.insert_one({
-        "title": title,
-        "source": source,
-        "material_type": material_type,
-        "content": content,
-    })
-    return result.inserted_id
+def _new_id() -> str:
+    return str(uuid.uuid4())
 
 
-def get_patient_reports(patient_id: str) -> list[dict[str, Any]]:
-    """Return all original reports belonging to a patient."""
-    return list(patient_reports.find({"patient_id": patient_id}))
+def save_patient_report(patient_id: str, title: str, report_text: str,
+                        file_name: str | None = None) -> str:
+    report_id = _new_id()
+    with get_connection() as connection:
+        connection.execute(
+            "INSERT INTO patient_reports VALUES (?, ?, ?, ?, ?, ?)",
+            (report_id, patient_id.strip(), title.strip(), report_text.strip(),
+             file_name, _now()),
+        )
+    return report_id
 
 
-def get_generated_reports(patient_id: str) -> list[dict[str, Any]]:
-    """Return all generated reports belonging to a patient."""
-    return list(generated_reports.find({"patient_id": patient_id}))
+def save_communication(patient_id: str, report_id: str | None, sender_role: str,
+                       message_text: str, tone: str | None = None,
+                       complexity: str | None = None) -> str:
+    message_id = _new_id()
+    with get_connection() as connection:
+        connection.execute(
+            "INSERT INTO communication_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (message_id, patient_id.strip(), report_id, sender_role,
+             message_text.strip(), tone, complexity, _now()),
+        )
+    return message_id
 
 
-create_indexes()
+def save_reference(title: str, publisher: str, source: str, text: str,
+                   chunk_size: int = 900, overlap: int = 150) -> int:
+    step = max(1, chunk_size - overlap)
+    chunks: list[tuple[Any, ...]] = []
+    for number, start in enumerate(range(0, len(text), step)):
+        chunk = text[start:start + chunk_size].strip()
+        if chunk:
+            chunks.append((_new_id(), title.strip(), publisher.strip(), source.strip(),
+                           number, chunk, _now()))
+        if start + chunk_size >= len(text):
+            break
+    with get_connection() as connection:
+        connection.executemany(
+            "INSERT INTO reference_chunks VALUES (?, ?, ?, ?, ?, ?, ?)", chunks
+        )
+    return len(chunks)
+
+
+def list_reports(patient_id: str | None = None) -> list[dict[str, Any]]:
+    query = "SELECT * FROM patient_reports"
+    parameters: tuple[str, ...] = ()
+    if patient_id:
+        query += " WHERE patient_id = ?"
+        parameters = (patient_id.strip(),)
+    query += " ORDER BY created_at DESC"
+    with get_connection() as connection:
+        return [dict(row) for row in connection.execute(query, parameters)]
+
+
+def list_communications(patient_id: str, report_id: str | None = None) -> list[dict[str, Any]]:
+    query = "SELECT * FROM communication_records WHERE patient_id = ?"
+    parameters: list[str] = [patient_id]
+    if report_id:
+        query += " AND report_id = ?"
+        parameters.append(report_id)
+    query += " ORDER BY created_at ASC"
+    with get_connection() as connection:
+        return [dict(row) for row in connection.execute(query, parameters)]
+
+
+def list_references() -> list[dict[str, Any]]:
+    with get_connection() as connection:
+        return [dict(row) for row in connection.execute(
+            "SELECT * FROM reference_chunks ORDER BY created_at DESC, chunk_number"
+        )]
+
+
+def delete_reference(title: str, publisher: str, source: str) -> int:
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """DELETE FROM reference_chunks
+               WHERE document_title = ? AND publisher = ? AND source = ?""",
+            (title.strip(), publisher.strip(), source.strip()),
+        )
+        return cursor.rowcount
+
+
+init_database()
