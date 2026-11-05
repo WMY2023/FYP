@@ -42,10 +42,18 @@ def init_database() -> None:
             );
             CREATE TABLE IF NOT EXISTS reference_chunks (
                 id TEXT PRIMARY KEY, document_title TEXT NOT NULL, publisher TEXT,
-                source TEXT, chunk_number INTEGER NOT NULL, chunk_text TEXT NOT NULL,
+                source TEXT, reference_type TEXT NOT NULL DEFAULT 'medical',
+                chunk_number INTEGER NOT NULL, chunk_text TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
         """)
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(reference_chunks)")
+        }
+        if "reference_type" not in columns:
+            connection.execute(
+                "ALTER TABLE reference_chunks ADD COLUMN reference_type TEXT NOT NULL DEFAULT 'medical'"
+            )
 
 
 def _now() -> str:
@@ -82,19 +90,26 @@ def save_communication(patient_id: str, report_id: str | None, sender_role: str,
 
 
 def save_reference(title: str, publisher: str, source: str, text: str,
-                   chunk_size: int = 900, overlap: int = 150) -> int:
+                   chunk_size: int = 900, overlap: int = 150,
+                   reference_type: str = "medical") -> int:
+    if reference_type not in {"tone", "medical"}:
+        raise ValueError("reference_type must be 'tone' or 'medical'")
     step = max(1, chunk_size - overlap)
     chunks: list[tuple[Any, ...]] = []
     for number, start in enumerate(range(0, len(text), step)):
         chunk = text[start:start + chunk_size].strip()
         if chunk:
             chunks.append((_new_id(), title.strip(), publisher.strip(), source.strip(),
-                           number, chunk, _now()))
+                           reference_type, number, chunk, _now()))
         if start + chunk_size >= len(text):
             break
     with get_connection() as connection:
         connection.executemany(
-            "INSERT INTO reference_chunks VALUES (?, ?, ?, ?, ?, ?, ?)", chunks
+            """INSERT INTO reference_chunks
+               (id, document_title, publisher, source, reference_type,
+                chunk_number, chunk_text, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            chunks,
         )
     return len(chunks)
 
@@ -121,20 +136,29 @@ def list_communications(patient_id: str, report_id: str | None = None) -> list[d
         return [dict(row) for row in connection.execute(query, parameters)]
 
 
-def list_references() -> list[dict[str, Any]]:
+def list_references(reference_type: str | None = None) -> list[dict[str, Any]]:
+    query = "SELECT * FROM reference_chunks"
+    parameters: tuple[str, ...] = ()
+    if reference_type:
+        query += " WHERE reference_type = ?"
+        parameters = (reference_type,)
+    query += " ORDER BY created_at DESC, chunk_number"
     with get_connection() as connection:
         return [dict(row) for row in connection.execute(
-            "SELECT * FROM reference_chunks ORDER BY created_at DESC, chunk_number"
+            query, parameters
         )]
 
 
-def delete_reference(title: str, publisher: str, source: str) -> int:
+def delete_reference(title: str, publisher: str, source: str,
+                     reference_type: str | None = None) -> int:
+    query = """DELETE FROM reference_chunks
+               WHERE document_title = ? AND publisher = ? AND source = ?"""
+    parameters: list[str] = [title.strip(), publisher.strip(), source.strip()]
+    if reference_type:
+        query += " AND reference_type = ?"
+        parameters.append(reference_type)
     with get_connection() as connection:
-        cursor = connection.execute(
-            """DELETE FROM reference_chunks
-               WHERE document_title = ? AND publisher = ? AND source = ?""",
-            (title.strip(), publisher.strip(), source.strip()),
-        )
+        cursor = connection.execute(query, parameters)
         return cursor.rowcount
 
 

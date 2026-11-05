@@ -27,9 +27,15 @@ class DatabaseTests(unittest.TestCase):
         self.assertGreater(count, 1)
         self.assertEqual(len(self.database.list_references()), count)
 
+    def test_references_are_separated_by_type(self):
+        self.database.save_reference("Style guide", "Clinic", "section 1", "warm and reassuring", reference_type="tone")
+        self.database.save_reference("Medical guide", "Clinic", "section 1", "blood pressure", reference_type="medical")
+        self.assertEqual(len(self.database.list_references("tone")), 1)
+        self.assertEqual(len(self.database.list_references("medical")), 1)
+
     def test_reference_can_be_deleted_with_all_chunks(self):
         self.database.save_reference("Guide", "Clinic", "section 1", "blood pressure " * 100, chunk_size=100, overlap=20)
-        deleted = self.database.delete_reference("Guide", "Clinic", "section 1")
+        deleted = self.database.delete_reference("Guide", "Clinic", "section 1", "medical")
         self.assertGreater(deleted, 1)
         self.assertEqual(self.database.list_references(), [])
 

@@ -6,7 +6,8 @@ A Streamlit prototype for doctor-controlled, patient-friendly medical report exp
 
 - Patient medical reports are stored in SQLite.
 - Reports can be pasted or uploaded as TXT, Markdown, or text-based PDF files.
-- Doctors select communication tone and explanation complexity.
+- Doctors can manage reports, explanations, references, and communication records.
+- Patients only access the report explanation workflow.
 - Reference documents are split into overlapping chunks and retrieved by lexical relevance.
 - Retrieved passages are shown with the generated explanation for traceability.
 - Doctor-patient and assistant communication records are stored.
